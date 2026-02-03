@@ -54,26 +54,28 @@ class LangFuseTracer(BaseTracer):
             from langfuse import Langfuse
 
             self._client = Langfuse(**config)
+            
+            # Test connection with new API (Langfuse 3.x)
             try:
-                from langfuse.api.core.request_options import RequestOptions
-
-                self._client.client.health.health(request_options=RequestOptions(timeout_in_seconds=1))
+                # In Langfuse 3.x, the health check is done differently
+                # Just try to create a trace to verify connection
+                test_trace = self._client.trace(
+                    id=str(self.trace_id),
+                    name=self.flow_id,
+                    user_id=self.user_id,
+                    session_id=self.session_id,
+                )
+                self.trace = test_trace
             except Exception as e:  # noqa: BLE001
-                logger.debug(f"can not connect to Langfuse: {e}")
+                logger.debug(f"Cannot connect to Langfuse: {e}")
                 return False
-            self.trace = self._client.trace(
-                id=str(self.trace_id),
-                name=self.flow_id,
-                user_id=self.user_id,
-                session_id=self.session_id,
-            )
 
         except ImportError:
             logger.exception("Could not import langfuse. Please install it with `pip install langfuse`.")
             return False
 
         except Exception as e:  # noqa: BLE001
-            logger.debug(f"Error setting up LangSmith tracer: {e}")
+            logger.debug(f"Error setting up Langfuse tracer: {e}")
             return False
 
         return True
@@ -156,9 +158,32 @@ class LangFuseTracer(BaseTracer):
         if not self._ready:
             return None
 
-        # get callback from parent span
-        stateful_client = self.spans[next(reversed(self.spans))] if len(self.spans) > 0 else self.trace
-        return stateful_client.get_langchain_handler()
+        try:
+            # Langfuse 3.x API: Use CallbackHandler from langfuse.langchain
+            from langfuse.langchain import CallbackHandler
+            
+            # Create a callback handler with trace context
+            # This links the LangChain execution to our existing Langfuse trace
+            # The CallbackHandler will use the default Langfuse client configuration
+            # (from environment variables) and connect to our trace via trace_id
+            return CallbackHandler(
+                trace_context={
+                    "trace_id": str(self.trace_id),
+                },
+                update_trace=True,  # Update the trace with LangChain execution details
+            )
+        except ImportError:
+            logger.warning("Could not import Langfuse CallbackHandler. Using legacy API.")
+            # Fallback to legacy API (Langfuse 2.x)
+            try:
+                stateful_client = self.spans[next(reversed(self.spans))] if len(self.spans) > 0 else self.trace
+                return stateful_client.get_langchain_handler()  # type: ignore[attr-defined]
+            except Exception as e:  # noqa: BLE001
+                logger.error(f"Error getting Langfuse callback handler (legacy): {e}")
+                return None
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Error creating Langfuse CallbackHandler: {e}")
+            return None
 
     @staticmethod
     def _get_config() -> dict:

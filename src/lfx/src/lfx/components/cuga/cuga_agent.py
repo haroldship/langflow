@@ -344,7 +344,6 @@ class CugaComponent(ToolCallingAgentComponent):
 
             logger.debug("[CUGA] Updating CUGA settings")
 
-            settings.advanced_features.registry = False
             settings.advanced_features.lite_mode = self.lite_mode
             settings.advanced_features.lite_mode_tool_threshold = self.lite_mode_tool_threshold
             settings.advanced_features.decomposition_strategy = self.decomposition_strategy
@@ -386,13 +385,46 @@ class CugaComponent(ToolCallingAgentComponent):
             instructions_to_use = self.instructions or ""
             logger.debug(f"[CUGA] Using instructions: {instructions_to_use[:100]}...")
 
+            # Get Langfuse callbacks for tracing
+            # Debug tracing service state
+            logger.debug(f"[CUGA] Tracing service exists: {hasattr(self, 'tracing_service')}")
+            if hasattr(self, 'tracing_service') and self.tracing_service:
+                logger.debug(f"[CUGA] Tracing service type: {type(self.tracing_service).__name__}")
+                logger.debug(f"[CUGA] Tracing service deactivated: {getattr(self.tracing_service, 'deactivated', 'N/A')}")
+                
+                # Check trace context
+                try:
+                    from langflow.services.tracing.service import trace_context_var
+                    trace_context = trace_context_var.get()
+                    logger.debug(f"[CUGA] Trace context exists: {trace_context is not None}")
+                    if trace_context:
+                        logger.debug(f"[CUGA] Trace context tracers: {list(trace_context.tracers.keys())}")
+                        for name, tracer in trace_context.tracers.items():
+                            logger.debug(f"[CUGA] Tracer '{name}' ready: {getattr(tracer, 'ready', 'N/A')}")
+                except Exception as e:
+                    logger.debug(f"[CUGA] Error checking trace context: {e}")
+            else:
+                logger.warning("[CUGA] No tracing service available")
+                
+            langchain_callbacks = self.get_langchain_callbacks()
+            logger.debug(f"[CUGA] Got {len(langchain_callbacks)} Langchain callbacks for tracing")
+            logger.debug(f"[CUGA] Callbacks: {[type(cb).__name__ for cb in langchain_callbacks]}")
+            
+            if len(langchain_callbacks) == 0:
+                logger.warning("[CUGA] No Langfuse callbacks available - check environment variables:")
+                logger.warning("[CUGA]   LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, LANGFUSE_HOST")
+
             # Create Cuga agent with new SDK
+            # Note: We pass callbacks to the agent, not to the LLM
+            # The CUGA SDK expects callbacks to be set on the agent instance
             logger.debug("[CUGA] Creating CugaAgent with new SDK")
             cuga_agent = CugaAgent(
                 tools=langchain_tools,
                 model=llm,
                 special_instructions=instructions_to_use if instructions_to_use else None,
+                callbacks=langchain_callbacks,  # Pass callbacks to agent constructor
             )
+            logger.debug(f"[CUGA] Created agent with {len(langchain_callbacks)} callbacks")
 
             # Get thread_id for conversation continuity
             thread_id = str(self.graph.session_id)
@@ -420,6 +452,7 @@ class CugaComponent(ToolCallingAgentComponent):
             logger.debug("[CUGA] Starting agent stream")
             last_state = None
             tool_events = {}  # Track tool events by run_id
+            received_final_answer = False  # Track if we got a final answer in the stream
 
             async for state_update in cuga_agent.stream(
                 message=message_to_send,
@@ -439,7 +472,8 @@ class CugaComponent(ToolCallingAgentComponent):
                 elif event["event"] == "on_tool_end":
                     yield event
                 elif event["event"] == "on_chain_end":
-                    # Final answer received
+                    # Final answer received in stream
+                    received_final_answer = True
                     yield event
                 elif event["event"] == "on_chain_error":
                     yield event
@@ -447,60 +481,63 @@ class CugaComponent(ToolCallingAgentComponent):
                     # Other events (thinking, processing)
                     yield event
 
-            # After stream completes, get the final state from the graph
-            # The Cuga SDK uses LangGraph with checkpointer, so we need to get the final state
-            logger.debug("[CUGA] Stream completed, getting final state from graph")
-            
-            try:
-                # Get the final state from the graph using the thread_id
-                final_state = cuga_agent.graph.get_state({"configurable": {"thread_id": thread_id}})
-                logger.debug(f"[CUGA] Final state type: {type(final_state)}")
-                logger.debug(f"[CUGA] Final state: {final_state}")
+            # Only get final state if we didn't receive a final answer in the stream
+            # This avoids unnecessary blocking calls and potential timeouts
+            if not received_final_answer:
+                logger.debug("[CUGA] No final answer in stream, getting final state from graph")
                 
-                # Extract the state values
-                if hasattr(final_state, "values"):
-                    state_values = final_state.values
-                    logger.debug(f"[CUGA] State values keys: {state_values.keys() if isinstance(state_values, dict) else 'N/A'}")
+                try:
+                    # Get the final state from the graph using the thread_id
+                    final_state = cuga_agent.graph.get_state({"configurable": {"thread_id": thread_id}})
+                    logger.debug(f"[CUGA] Final state type: {type(final_state)}")
+                    logger.debug(f"[CUGA] Final state: {final_state}")
                     
-                    # Try to extract final answer from various possible fields
-                    final_answer = None
-                    
-                    # Check for messages field (LangGraph pattern)
-                    if isinstance(state_values, dict) and "messages" in state_values:
-                        messages = state_values.get("messages", [])
-                        logger.debug(f"[CUGA] Found {len(messages)} messages in final state")
-                        if messages and len(messages) > 0:
-                            last_message = messages[-1]
-                            logger.debug(f"[CUGA] Last message type: {type(last_message)}")
-                            if isinstance(last_message, AIMessage):
-                                final_answer = last_message.content
-                                logger.debug(f"[CUGA] Extracted answer from last AI message: '{final_answer}'")
-                    
-                    # Check for final_answer field
-                    if not final_answer and isinstance(state_values, dict) and "final_answer" in state_values:
-                        final_answer = state_values.get("final_answer", "")
-                        logger.debug(f"[CUGA] Found final_answer field: '{final_answer}'")
-                    
-                    # Check for output field
-                    if not final_answer and isinstance(state_values, dict) and "output" in state_values:
-                        final_answer = state_values.get("output", "")
-                        logger.debug(f"[CUGA] Found output field: '{final_answer}'")
-                    
-                    if final_answer and str(final_answer).strip():
-                        logger.debug(f"[CUGA] Yielding final on_chain_end event with answer: '{final_answer}'")
-                        yield {
-                            "event": "on_chain_end",
-                            "run_id": str(uuid.uuid4()),
-                            "name": "CugaAgent",
-                            "data": {"output": AgentFinish(return_values={"output": str(final_answer)}, log="")},
-                        }
+                    # Extract the state values
+                    if hasattr(final_state, "values"):
+                        state_values = final_state.values
+                        logger.debug(f"[CUGA] State values keys: {state_values.keys() if isinstance(state_values, dict) else 'N/A'}")
+                        
+                        # Try to extract final answer from various possible fields
+                        final_answer = None
+                        
+                        # Check for messages field (LangGraph pattern)
+                        if isinstance(state_values, dict) and "messages" in state_values:
+                            messages = state_values.get("messages", [])
+                            logger.debug(f"[CUGA] Found {len(messages)} messages in final state")
+                            if messages and len(messages) > 0:
+                                last_message = messages[-1]
+                                logger.debug(f"[CUGA] Last message type: {type(last_message)}")
+                                if isinstance(last_message, AIMessage):
+                                    final_answer = last_message.content
+                                    logger.debug(f"[CUGA] Extracted answer from last AI message: '{final_answer}'")
+                        
+                        # Check for final_answer field
+                        if not final_answer and isinstance(state_values, dict) and "final_answer" in state_values:
+                            final_answer = state_values.get("final_answer", "")
+                            logger.debug(f"[CUGA] Found final_answer field: '{final_answer}'")
+                        
+                        # Check for output field
+                        if not final_answer and isinstance(state_values, dict) and "output" in state_values:
+                            final_answer = state_values.get("output", "")
+                            logger.debug(f"[CUGA] Found output field: '{final_answer}'")
+                        
+                        if final_answer and str(final_answer).strip():
+                            logger.debug(f"[CUGA] Yielding final on_chain_end event with answer: '{final_answer}'")
+                            yield {
+                                "event": "on_chain_end",
+                                "run_id": str(uuid.uuid4()),
+                                "name": "CugaAgent",
+                                "data": {"output": AgentFinish(return_values={"output": str(final_answer)}, log="")},
+                            }
+                        else:
+                            logger.warning("[CUGA] No final answer found in state values")
                     else:
-                        logger.warning("[CUGA] No final answer found in state values")
-                else:
-                    logger.warning(f"[CUGA] Final state has no 'values' attribute: {dir(final_state)}")
-            except Exception as e:
-                logger.error(f"[CUGA] Error getting final state: {e}")
-                logger.error(f"[CUGA] Traceback: {traceback.format_exc()}")
+                        logger.warning(f"[CUGA] Final state has no 'values' attribute: {dir(final_state)}")
+                except Exception as e:
+                    logger.error(f"[CUGA] Error getting final state: {e}")
+                    logger.error(f"[CUGA] Traceback: {traceback.format_exc()}")
+            else:
+                logger.debug("[CUGA] Final answer already received in stream, skipping get_state()")
 
         except Exception as e:
             # Comprehensive error handling - catch ALL exceptions
